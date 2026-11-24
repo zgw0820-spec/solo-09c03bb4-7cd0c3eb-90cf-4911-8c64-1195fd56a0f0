@@ -382,73 +382,8 @@ def compute_plan(
 
 
 # ---------------------------------------------------------------------------
-# Energy accounting for the drill clock
+# Device state at a drill minute
 # ---------------------------------------------------------------------------
-
-
-def consumption_between(
-    devices: Sequence[Device], plan: Plan, start_minute: int, end_minute: int
-) -> float:
-    """Energy drawn in [start_minute, end_minute).
-
-    A device draws its power until it is *stopped* (``action.end``), including
-    the time it spends waiting for its turn.  Its start time does not matter
-    for the power total.
-    """
-    if end_minute <= start_minute:
-        return 0.0
-    watt_minutes = 0.0
-    for device in devices:
-        action = plan.action_for(device.id)
-        active = max(0, min(end_minute, action.end) - start_minute)
-        watt_minutes += device.power_w * active
-    return watt_minutes / 60.0
-
-
-def residual_at(
-    devices: Sequence[Device],
-    plan: Plan,
-    anchors: Sequence[dict],
-    minute: int,
-) -> float:
-    """Residual energy at ``minute`` using the latest recorded measurement."""
-    usable = [a for a in anchors if a["minute"] <= minute]
-    if not usable:
-        raise PlanError("缺少余电基准")
-    anchor = max(usable, key=lambda a: a["minute"])
-    consumed = consumption_between(devices, plan, anchor["minute"], minute)
-    return max(0.0, anchor["residual_wh"] - consumed)
-
-
-def timeline(
-    devices: Sequence[Device],
-    plan: Plan,
-    anchors: Sequence[dict],
-    *,
-    horizon: int,
-) -> List[dict]:
-    """Minute-by-minute residual energy / draw for charts and drill playback."""
-    points: List[dict] = []
-    for minute in range(0, max(horizon, 1) + 1):
-        residual = residual_at(devices, plan, anchors, minute)
-        draw = sum(
-            d.power_w
-            for d in devices
-            if plan.action_for(d.id).start <= minute < plan.action_for(d.id).end
-        )
-        points.append(
-            {
-                "minute": minute,
-                "draw_w": draw,
-                "residual_wh": round(residual, 3),
-                "active": [
-                    d.id
-                    for d in devices
-                    if plan.action_for(d.id).start <= minute < plan.action_for(d.id).end
-                ],
-            }
-        )
-    return points
 
 
 def device_state(

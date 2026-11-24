@@ -60,9 +60,32 @@ def check_invariants(session, issued_history):
     for point in session["history"]:
         assert point["residual_wh"] >= 0
 
+    # RLE history invariants: segments cover [0, now] contiguously, every
+    # segment stores a consistent start/end anchor, and the revision log is
+    # append-only in filing order.
+    segments = session["history_segments"]
+    assert segments, "history must always contain at least the opening anchor"
+    assert segments[0]["start"] == 0
+    cursor = segments[0]["end"]
+    for seg in segments[1:]:
+        assert seg["start"] == cursor
+        cursor = seg["end"]
+    assert cursor == session["now"]
+    for seg in segments:
+        assert seg["end"] >= seg["start"]
+        assert seg["residual_wh"] >= 0 and seg["start_residual_wh"] >= 0
+        if seg["end"] > seg["start"]:
+            assert seg["draw_w"] >= 0
+    log = session["revision_log"]
+    assert [entry["seq"] for entry in log] == list(range(1, len(log) + 1))
+    assert all(entry["minute"] <= session["now"] for entry in log)
+    assert session["revision_count"] == len(log)
+
     if not session["feasible"]:
         assert session["shortfall_wh"] > 0
         assert session["can_advance"] is False
+        # No future curve may be advertised while the drill is starved.
+        assert session["projection_segments"] == []
 
 
 @pytest.mark.parametrize("seed", range(12))

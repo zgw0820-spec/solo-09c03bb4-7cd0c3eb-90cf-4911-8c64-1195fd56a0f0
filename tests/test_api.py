@@ -205,3 +205,169 @@ def test_revise_validates_input(client):
     assert client.post(f"/api/drills/{sid}/revise", json={"residual_wh": -1}).status_code == 422
     assert client.get("/api/drills/nope").status_code == 404
     assert client.post("/api/drills/nope/advance", json={"minutes": 1}).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Run-length encoded refresh chain
+# ---------------------------------------------------------------------------
+
+
+def _expand_segments(segments):
+    points = {}
+    for seg in segments:
+        for minute in range(seg["start"], seg["end"] + 1):
+            residual = max(
+                0.0,
+                seg["start_residual_wh"]
+                - seg["draw_w"] * (minute - seg["start"]) / 60.0,
+            )
+            points[minute] = (round(residual, 3), seg["draw_w"])
+    return points
+
+
+def test_compact_payload_segments_do_not_grow_with_minutes(client):
+    # Two long jobs: a long constant-power stretch followed by one load drop.
+    devices = [
+        {"id": "a", "name": "A", "power_w": 300, "shutdown_min": 120, "depends_on": []},
+        {"id": "b", "name": "B", "power_w": 200, "shutdown_min": 60, "depends_on": []},
+    ]
+    created = client.post(
+        "/api/drills",
+        json={"devices": devices, "residual_wh": 10000.0},
+        params={"compact": "true"},
+    ).json()
+    sid = created["id"]
+    assert created["compact"] is True
+    assert created["history"] is None and created["projection"] is None
+
+    session = created
+    for _ in range(120):
+        session = client.post(
+            f"/api/drills/{sid}/advance",
+            json={"minutes": 1},
+            params={"compact": "true"},
+        ).json()
+
+    # 120 one-minute advances, but only the initial run and one load drop.
+    assert session["now"] == 120
+    assert len(session["history_segments"]) == 2
+    first, second = session["history_segments"]
+    assert (first["start"], first["end"], first["draw_w"]) == (0, 60, 500)
+    assert (second["start"], second["end"], second["draw_w"]) == (60, 120, 300)
+    # The load-drop knee and its residual anchor are preserved.
+    assert first["residual_wh"] == 9500.0
+    assert second["start_residual_wh"] == 9500.0
+
+
+def test_compact_expansion_matches_legacy_minute_history(client):
+    sid_full = client.post("/api/drills", json=sample_payload(client)).json()["id"]
+    sid_compact = client.post(
+        "/api/drills", json=sample_payload(client), params={"compact": "true"}
+    ).json()["id"]
+    for _ in range(12):
+        client.post(f"/api/drills/{sid_full}/advance", json={"minutes": 1})
+        client.post(
+            f"/api/drills/{sid_compact}/advance",
+            json={"minutes": 1},
+            params={"compact": "true"},
+        )
+
+    legacy = {h["minute"]: (h["residual_wh"], h["draw_w"])
+              for h in client.get(f"/api/drills/{sid_full}").json()["history"]}
+    compact_segments = client.get(
+        f"/api/drills/{sid_compact}", params={"compact": "true"}
+    ).json()["history_segments"]
+    expanded = _expand_segments(compact_segments)
+    assert set(expanded) == set(legacy)
+    for minute, (residual, draw) in expanded.items():
+        legacy_residual, legacy_draw = legacy[minute]
+        assert draw == legacy_draw
+        assert abs(residual - legacy_residual) < 0.002
+
+    # The default API still returns the full minute-by-minute arrays.
+    default_state = client.get(f"/api/drills/{sid_compact}").json()
+    assert isinstance(default_state["history"], list)
+    assert isinstance(default_state["projection"], list)
+    assert default_state["compact"] is False
+
+
+def test_minute_lookup_reports_residual_draw_and_revisions(client):
+    sid = client.post(
+        "/api/drills", json=sample_payload(client), params={"compact": "true"}
+    ).json()["id"]
+    client.post(f"/api/drills/{sid}/advance", json={"minutes": 3},
+                params={"compact": "true"})
+
+    # Three revisions filed at the same minute, in order.
+    for value in (300.0, 260.0, 330.0):
+        client.post(
+            f"/api/drills/{sid}/revise",
+            json={"residual_wh": value},
+            params={"compact": "true"},
+        )
+
+    record = client.get(f"/api/drills/{sid}/minutes/3").json()
+    assert record["minute"] == 3
+    assert record["residual_wh"] == 330.0
+    assert [r["residual_wh"] for r in record["revisions"]] == [300.0, 260.0, 330.0]
+    assert record["revision_count"] == 3
+
+    # Minutes before the revision keep their originally recorded reading.
+    earlier = client.get(f"/api/drills/{sid}/minutes/2").json()
+    assert earlier["revision_count"] == 0
+    assert earlier["residual_wh"] == round(320 - 2570 * 2 / 60.0, 3)
+
+    # A minute that has not arrived yet is rejected.
+    response = client.get(f"/api/drills/{sid}/minutes/99")
+    assert response.status_code == 404
+
+
+def test_revision_jump_preserved_but_history_readings_unchanged(client):
+    sid = client.post(
+        "/api/drills", json=sample_payload(client), params={"compact": "true"}
+    ).json()["id"]
+    client.post(f"/api/drills/{sid}/advance", json={"minutes": 3},
+                params={"compact": "true"})
+    before = client.get(f"/api/drills/{sid}/minutes/2").json()
+
+    revised = client.post(
+        f"/api/drills/{sid}/revise",
+        json={"residual_wh": 400.0},
+        params={"compact": "true"},
+    ).json()
+    # The jump is a zero-length anchor at the revision minute.
+    jumps = [s for s in revised["history_segments"]
+             if s["start"] == 3 and s["end"] == 3]
+    assert len(jumps) == 1 and jumps[0]["residual_wh"] == 400.0
+    # Earlier readings are untouched.
+    after = client.get(f"/api/drills/{sid}/minutes/2").json()
+    assert after["residual_wh"] == before["residual_wh"]
+    assert after["draw_w"] == before["draw_w"]
+
+
+def test_shortage_withdraws_projection_and_revision_restores_it(client):
+    sid = client.post(
+        "/api/drills", json=sample_payload(client), params={"compact": "true"}
+    ).json()["id"]
+    client.post(f"/api/drills/{sid}/advance", json={"minutes": 3},
+                params={"compact": "true"})
+
+    starved = client.post(
+        f"/api/drills/{sid}/revise",
+        json={"residual_wh": 1.0},
+        params={"compact": "true"},
+    ).json()
+    assert starved["feasible"] is False
+    assert starved["projection_segments"] == []
+    assert client.post(f"/api/drills/{sid}/advance", json={"minutes": 1}).status_code == 409
+
+    recovered = client.post(
+        f"/api/drills/{sid}/revise",
+        json={"residual_wh": 400.0},
+        params={"compact": "true"},
+    ).json()
+    assert recovered["feasible"] is True
+    assert len(recovered["projection_segments"]) >= 1
+    # Recorded history before the shortage still holds its original values.
+    record = client.get(f"/api/drills/{sid}/minutes/2").json()
+    assert record["residual_wh"] == round(320 - 2570 * 2 / 60.0, 3)

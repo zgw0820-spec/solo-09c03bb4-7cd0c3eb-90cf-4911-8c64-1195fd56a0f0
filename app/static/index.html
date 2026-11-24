@@ -148,15 +148,27 @@
       <div class="drill-right">
         <div class="device-grid" id="live-devices"></div>
         <div class="chart-card">
-          <h3>演练记录</h3>
+          <h3>演练记录（恒功率段）</h3>
+          <p class="hint small">
+            连续恒功率且无补录的时段合并为一段，记录量不随推进分钟数增长；
+            设备停妥降载与补录跳变各自形成新段。
+          </p>
           <div class="table-wrap log-wrap">
             <table class="log-table">
               <thead>
-                <tr><th>分钟</th><th>余电 (Wh)</th><th>功率 (W)</th></tr>
+                <tr><th>分钟段</th><th>余电起→止 (Wh)</th><th>功率 (W)</th></tr>
               </thead>
               <tbody id="history-rows"></tbody>
             </table>
           </div>
+          <div class="minute-lookup-bar">
+            <label class="field">
+              <span>查询任意已到达分钟</span>
+              <input id="minute-lookup-input" type="number" min="0" step="1" value="0" />
+            </label>
+            <button class="btn ghost" id="btn-minute-lookup" type="button">查该分钟</button>
+          </div>
+          <div class="minute-lookup" id="minute-lookup-result" hidden></div>
         </div>
         <div class="chart-card">
           <h3>事件</h3>

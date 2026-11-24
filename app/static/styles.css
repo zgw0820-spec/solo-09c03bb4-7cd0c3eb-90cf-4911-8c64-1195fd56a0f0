@@ -263,6 +263,23 @@ input:focus, select:focus { outline: 2px solid rgba(79, 140, 255, 0.5); outline-
 .revision .ok { color: #9bf3da; }
 .revision .bad { color: #ffb3ba; }
 
+.minute-lookup-bar {
+  display: flex; align-items: flex-end; gap: 10px; margin-top: 12px;
+}
+.minute-lookup-bar .field { flex: 1; }
+.minute-lookup {
+  margin-top: 10px; font-size: 12.5px; line-height: 1.7;
+  border-radius: 10px; padding: 10px 13px;
+}
+.minute-lookup.ok {
+  color: #c5d0ea; background: rgba(79, 140, 255, 0.08);
+  border: 1px solid rgba(79, 140, 255, 0.3);
+}
+.minute-lookup.bad {
+  color: #ffc0c6; background: rgba(255, 92, 108, 0.08);
+  border: 1px solid rgba(255, 92, 108, 0.32);
+}
+
 .device-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; }
 .device-card {
   background: rgba(13, 21, 40, 0.85);

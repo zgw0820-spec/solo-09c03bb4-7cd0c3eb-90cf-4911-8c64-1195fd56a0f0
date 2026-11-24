@@ -41,6 +41,12 @@ async function api(path, options = {}) {
   return payload;
 }
 
+// Drill state requests ask for the run-length encoded payload: its size is
+// bounded by the number of load-drop minutes and revisions, not by the number
+// of minutes already drilled.
+const drillApi = (path, options = {}) =>
+  api(`${path}${path.includes("?") ? "&" : "?"}compact=true`, options);
+
 function uniqueId(base) {
   const taken = new Set(state.devices.map((d) => d.id));
   if (!taken.has(base)) return base;
@@ -70,6 +76,43 @@ function showError(message) {
     box.hidden = true;
     box.textContent = "";
   }
+}
+
+// ---------------------------------------------------------------------------
+// Run-length encoded curve helpers
+// ---------------------------------------------------------------------------
+
+// Residual at any minute covered by a segment: linear decline from the
+// segment's start anchor at a constant draw.
+function segmentResidualAt(seg, minute) {
+  const offset = Math.max(0, minute - seg.start);
+  return Math.max(0, seg.start_residual_wh - (seg.draw_w * offset) / 60);
+}
+
+// Anchor points for drawing: every segment boundary (load drops and revision
+// jumps), with same-minute revisions collapsed onto the latest reading.
+function segmentAnchorPoints(segments) {
+  const points = [];
+  for (const seg of segments) {
+    const startPoint = {
+      minute: seg.start,
+      residual_wh: Number(seg.start_residual_wh),
+      draw_w: seg.draw_w,
+    };
+    if (points.length && points[points.length - 1].minute === seg.start) {
+      points[points.length - 1] = startPoint;
+    } else {
+      points.push(startPoint);
+    }
+    if (seg.end > seg.start) {
+      points.push({
+        minute: seg.end,
+        residual_wh: Number(seg.residual_wh),
+        draw_w: seg.draw_w,
+      });
+    }
+  }
+  return points;
 }
 
 // ---------------------------------------------------------------------------
@@ -276,7 +319,7 @@ async function startDrill(event) {
   $("btn-start").disabled = true;
   try {
     const payload = payloadFromEditor();
-    const session = await api("/api/drills", {
+    const session = await drillApi("/api/drills", {
       method: "POST",
       body: JSON.stringify(payload),
     });
@@ -521,10 +564,19 @@ function renderChart(session) {
   const H = 260;
   const pad = { top: 18, right: 16, bottom: 28, left: 48 };
 
-  const history = session.history || [];
-  const projection = session.plan.feasible ? session.projection || [] : [];
-  const points = history.concat(
-    projection.filter((p) => p.minute > (history.length ? history[history.length - 1].minute : -1)),
+  // The recorded curve and the projection are both RLE: only load-drop and
+  // residual-revision anchors are transferred, so a long constant-power run
+  // costs the same payload as a one-minute step.
+  const historySegments = session.history_segments || [];
+  const projectionSegments = session.plan.feasible
+    ? session.projection_segments || []
+    : [];
+  const historyPoints = segmentAnchorPoints(historySegments);
+  const projectionPoints = segmentAnchorPoints(projectionSegments);
+  const points = historyPoints.concat(
+    projectionPoints.filter(
+      (p) => p.minute > (historyPoints.length ? historyPoints[historyPoints.length - 1].minute : -1),
+    ),
   );
 
   svg.innerHTML = "";
@@ -563,30 +615,42 @@ function renderChart(session) {
     );
   }
 
-  if (projection.length) {
-    const projPath = projection
+  const toPath = (pts) =>
+    pts
       .map((p, i) => `${i === 0 ? "M" : "L"}${x(p.minute).toFixed(1)},${y(p.residual_wh).toFixed(1)}`)
       .join(" ");
+
+  // Projection: dashed line through the future anchors; inflection minutes
+  // (device load drops) stay visible because each is its own anchor.
+  if (projectionPoints.length) {
     svg.insertAdjacentHTML(
       "beforeend",
-      `<path d="${projPath}" fill="none" stroke="#4f8cff" stroke-width="2"
+      `<path d="${toPath(projectionPoints)}" fill="none" stroke="#4f8cff" stroke-width="2"
          stroke-dasharray="5 5" opacity="0.75" />`,
     );
   }
 
-  const solidPoints = history.filter((p) => p.minute <= session.now);
-  if (solidPoints.length) {
-    const area = solidPoints
-      .map((p, i) => `${i === 0 ? "M" : "L"}${x(p.minute).toFixed(1)},${y(p.residual_wh).toFixed(1)}`)
-      .join(" ");
-    const areaFill = `${area} L${x(solidPoints[solidPoints.length - 1].minute).toFixed(1)},${y(0).toFixed(1)} L${x(solidPoints[0].minute).toFixed(1)},${y(0).toFixed(1)} Z`;
+  // Recorded history: solid line + area. Revision jumps are zero-length
+  // segments, so they render as vertical steps at the revision minute.
+  if (historyPoints.length) {
+    const area = toPath(historyPoints);
+    const last = historyPoints[historyPoints.length - 1];
+    const areaFill = `${area} L${x(last.minute).toFixed(1)},${y(0).toFixed(1)} L${x(historyPoints[0].minute).toFixed(1)},${y(0).toFixed(1)} Z`;
     svg.insertAdjacentHTML(
       "beforeend",
       `<path d="${areaFill}" fill="rgba(34,211,166,0.12)" />
        <path d="${area}" fill="none" stroke="#22d3a6" stroke-width="2.4" />`,
     );
 
-    const last = solidPoints[solidPoints.length - 1];
+    // Mark every recorded anchor, including load-drop knees and revision jumps.
+    historyPoints.forEach((p) => {
+      svg.insertAdjacentHTML(
+        "beforeend",
+        `<circle cx="${x(p.minute)}" cy="${y(p.residual_wh)}" r="3.2"
+           fill="#22d3a6" stroke="#0d1528" stroke-width="1.5" />`,
+      );
+    });
+
     svg.insertAdjacentHTML(
       "beforeend",
       `<circle cx="${x(last.minute)}" cy="${y(last.residual_wh)}" r="4.5"
@@ -605,10 +669,16 @@ function renderChart(session) {
 function renderHistory(session) {
   const tbody = $("history-rows");
   tbody.innerHTML = "";
-  const rows = session.history.slice().reverse().slice(0, 80);
-  rows.forEach((h) => {
+  // One row per constant-power segment instead of one row per minute: the
+  // table no longer grows while the draw is unchanged.
+  const segments = (session.history_segments || []).slice().reverse();
+  segments.forEach((seg) => {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${h.minute}</td><td>${fmt(h.residual_wh)}</td><td>${fmt(h.draw_w, 0)}</td>`;
+    const span = seg.end === seg.start ? `${seg.start}` : `${seg.start}–${seg.end}`;
+    tr.innerHTML =
+      `<td>${span}</td>` +
+      `<td>${fmt(seg.start_residual_wh)} → ${fmt(seg.residual_wh)}</td>` +
+      `<td>${fmt(seg.draw_w, 0)}</td>`;
     tbody.appendChild(tr);
   });
 }
@@ -708,7 +778,7 @@ async function advance(body) {
   if (!state.session || state.busy) return;
   state.busy = true;
   try {
-    const session = await api(`/api/drills/${state.session.id}/advance`, {
+    const session = await drillApi(`/api/drills/${state.session.id}/advance`, {
       method: "POST",
       body: JSON.stringify(body),
     });
@@ -733,7 +803,7 @@ async function revise() {
   showError("");
   $("btn-revise").disabled = true;
   try {
-    const session = await api(`/api/drills/${state.session.id}/revise`, {
+    const session = await drillApi(`/api/drills/${state.session.id}/revise`, {
       method: "POST",
       body: JSON.stringify({ residual_wh: value }),
     });
@@ -744,6 +814,49 @@ async function revise() {
   } finally {
     state.busy = false;
     renderSession();
+  }
+}
+
+async function lookupMinute() {
+  if (!state.session) return;
+  const input = $("minute-lookup-input");
+  const result = $("minute-lookup-result");
+  const minute = Math.round(Number(input.value));
+  if (Number.isNaN(minute) || minute < 0) {
+    result.hidden = false;
+    result.className = "minute-lookup bad";
+    result.textContent = "请输入不小于 0 的分钟数。";
+    return;
+  }
+  if (minute > state.session.now) {
+    result.hidden = false;
+    result.className = "minute-lookup bad";
+    result.textContent = `第 ${minute} 分钟尚未到达（当前第 ${state.session.now} 分钟）。`;
+    return;
+  }
+  try {
+    const data = await drillApi(`/api/drills/${state.session.id}/minutes/${minute}`);
+    const lines = [
+      `第 ${data.minute} 分钟：余电 ${fmt(data.residual_wh)} Wh，实时功率 ${fmt(data.draw_w, 0)} W`,
+      `所属恒功率段：第 ${data.segment_start}–${data.segment_end} 分钟`,
+    ];
+    if (data.revisions.length) {
+      lines.push(
+        `本分钟补录 ${data.revision_count} 次（按录入顺序）：` +
+          data.revisions
+            .map((r) => `#${r.seq} ${fmt(r.residual_wh)} Wh${r.feasible ? "" : "（缺电）"}`)
+            .join("；"),
+      );
+    } else {
+      lines.push("本分钟没有补录记录。");
+    }
+    result.hidden = false;
+    result.className = "minute-lookup ok";
+    result.innerHTML = lines.map(escapeHtml).join("<br />");
+  } catch (err) {
+    result.hidden = false;
+    result.className = "minute-lookup bad";
+    result.textContent = err.message;
   }
 }
 
@@ -777,6 +890,13 @@ function bind() {
     advance({ minutes: Math.max(1, remaining) });
   });
   $("btn-revise").addEventListener("click", revise);
+  $("btn-minute-lookup").addEventListener("click", lookupMinute);
+  $("minute-lookup-input").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      lookupMinute();
+    }
+  });
 }
 
 async function init() {
